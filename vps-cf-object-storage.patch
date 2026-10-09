@@ -1,0 +1,1147 @@
+From: checklist-patch
+Subject: [PATCH] CF-only deploy + Object Storage for packages >3.5MB
+
+diff --git a/deploy/test/cf-package-source.sh b/deploy/test/cf-package-source.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/cf-package-source.sh
+@@ -0,0 +1,98 @@
++#!/usr/bin/env bash
++# Resolve how to pass a zip to `yc serverless function version create`.
++#
++# Yandex direct --source-path limit: 3.5 MB.
++# Larger packages MUST go via Object Storage:
++#   --package-bucket-name + --package-object-name
++#
++# Usage:
++#   source deploy/test/cf-package-source.sh
++#   CF_VERSION_SOURCE_ARGS=( $(cf_package_source_args /path/to.zip ydb-proxy) )
++#   yc serverless function version create ... "${CF_VERSION_SOURCE_ARGS[@]}"
++#
++# Requires env (from load-env / .env.test):
++#   YC_FOLDER_ID
++#   CF_PACKAGE_BUCKET   (Object Storage bucket name)
++# Optional:
++#   CF_PACKAGE_PREFIX   (default: cf-packages)
++#   CF_DIRECT_UPLOAD_MAX_BYTES (default: 3500000)
++
++cf_package_source_args() {
++  local zip_path="$1"
++  local object_slug="${2:-package}"
++
++  if [[ ! -f "$zip_path" ]]; then
++    echo "❌ zip not found: $zip_path" >&2
++    return 1
++  fi
++
++  local size
++  size=$(wc -c < "$zip_path" | tr -d ' ')
++  local max="${CF_DIRECT_UPLOAD_MAX_BYTES:-3500000}"
++
++  echo "📦 package: $zip_path ($(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "${size} bytes"))" >&2
++
++  if [[ "$size" -le "$max" ]]; then
++    echo "   ≤ 3.5MB → direct --source-path" >&2
++    echo --source-path
++    echo "$zip_path"
++    return 0
++  fi
++
++  echo "   > 3.5MB → Object Storage upload required" >&2
++
++  local bucket="${CF_PACKAGE_BUCKET:-}"
++  if [[ -z "$bucket" ]]; then
++    echo "❌ Zip is larger than 3.5MB. Set CF_PACKAGE_BUCKET in deploy/test/.env.test" >&2
++    echo "   Example:" >&2
++    echo "     CF_PACKAGE_BUCKET=checklist-cf-packages-test" >&2
++    echo "   Create bucket once:" >&2
++    echo "     yc storage bucket create --name checklist-cf-packages-test --folder-id \"\$YC_FOLDER_ID\"" >&2
++    echo "   SA needs roles: storage.uploader (or storage.editor) on the bucket/folder" >&2
++    return 1
++  fi
++
++  : "${YC_FOLDER_ID:?YC_FOLDER_ID required for bucket ensure}"
++
++  # ensure bucket exists
++  if ! yc storage bucket get --name "$bucket" >/dev/null 2>&1; then
++    echo "=== create Object Storage bucket: $bucket ===" >&2
++    yc storage bucket create \
++      --name "$bucket" \
++      --folder-id "$YC_FOLDER_ID" \
++      --default-storage-class standard \
++      --max-size 10737418240 \
++      >/dev/null
++    echo "   bucket created" >&2
++  else
++    echo "   bucket exists: $bucket" >&2
++  fi
++
++  local prefix="${CF_PACKAGE_PREFIX:-cf-packages}"
++  local ts
++  ts=$(date -u +%Y%m%dT%H%M%SZ)
++  local key="${prefix}/${object_slug}/${ts}-$(basename "$zip_path")"
++
++  echo "=== upload s3://${bucket}/${key} ===" >&2
++  # yc storage cp works for Object Storage
++  if yc storage cp "$zip_path" "s3://${bucket}/${key}" --folder-id "$YC_FOLDER_ID" 2>/dev/null; then
++    :
++  else
++    # fallback s3api
++    yc storage s3api put-object \
++      --bucket "$bucket" \
++      --key "$key" \
++      --body "$zip_path" \
++      >/dev/null
++  fi
++
++  echo "   uploaded OK" >&2
++  echo --package-bucket-name
++  echo "$bucket"
++  echo --package-object-name
++  echo "$key"
++}
++
++# Read args into array helper for bash callers
++#   mapfile -t CF_VERSION_SOURCE_ARGS < <(cf_package_source_args "$zip" "ydb")
++# Note: mapfile keeps newlines; we echo one flag/value per line.
+diff --git a/deploy/test/deploy-ydb-fn.sh b/deploy/test/deploy-ydb-fn.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/deploy-ydb-fn.sh
+@@ -0,0 +1,99 @@
++#!/usr/bin/env bash
++# Deploy YDB proxy Cloud Function (TEST)
++# Packages with @ydbjs/* usually exceed 3.5MB → Object Storage path.
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++# shellcheck disable=SC1091
++source "$ROOT_DIR/deploy/test/load-env.sh"
++# shellcheck disable=SC1091
++source "$ROOT_DIR/deploy/test/cf-package-source.sh"
++
++: "${YDB_FN_NAME:=checklist-ydb-proxy-test}"
++: "${YDB_FN_RUNTIME:=nodejs18}"
++: "${YDB_FN_ENTRYPOINT:=index.handler}"
++: "${YDB_FN_MEMORY:=256m}"
++: "${YDB_FN_TIMEOUT:=15s}"
++
++: "${ADMIN_YDB_ENDPOINT:?Set ADMIN_YDB_ENDPOINT in .env.test}"
++: "${ADMIN_YDB_DATABASE:?Set ADMIN_YDB_DATABASE in .env.test}"
++: "${CLIENT_YDB_ENDPOINT:?Set CLIENT_YDB_ENDPOINT in .env.test}"
++: "${CLIENT_YDB_DATABASE:?Set CLIENT_YDB_DATABASE in .env.test}"
++
++FN_DIR="$ROOT_DIR/ydb-function"
++WORK_DIR=$(mktemp -d)
++trap 'rm -rf "$WORK_DIR"' EXIT
++
++echo "=== pack function ==="
++cp "$FN_DIR/index.js" "$FN_DIR/package.json" "$WORK_DIR/"
++(
++  cd "$WORK_DIR"
++  npm install --omit=dev --no-audit --no-fund
++
++  # slim zip: drop junk from node_modules (still often >3.5MB with ydb sdk)
++  zip -qr function.zip index.js package.json package-lock.json node_modules \
++    -x "node_modules/*/.git/*" \
++    -x "node_modules/*/test/*" \
++    -x "node_modules/*/tests/*" \
++    -x "node_modules/*/*/test/*" \
++    -x "node_modules/**/docs/*" \
++    -x "node_modules/**/*.md" \
++    -x "node_modules/**/*.ts" \
++    -x "node_modules/**/tsconfig.json" \
++    -x "node_modules/**/*.map" \
++    -x "node_modules/**/example/*" \
++    -x "node_modules/**/examples/*" \
++    -x "node_modules/**/.github/*"
++)
++
++ZIP_PATH="$WORK_DIR/function.zip"
++ls -lh "$ZIP_PATH"
++
++echo "=== resolve package source (direct vs Object Storage) ==="
++mapfile -t CF_VERSION_SOURCE_ARGS < <(cf_package_source_args "$ZIP_PATH" "ydb-proxy")
++if [[ ${#CF_VERSION_SOURCE_ARGS[@]} -lt 2 ]]; then
++  echo "❌ failed to resolve package source"
++  exit 1
++fi
++echo "   yc args: ${CF_VERSION_SOURCE_ARGS[*]}"
++
++echo "=== ensure function exists ==="
++if ! yc serverless function get --name "$YDB_FN_NAME" --folder-id "$YC_FOLDER_ID" >/dev/null 2>&1; then
++  yc serverless function create --name "$YDB_FN_NAME" --folder-id "$YC_FOLDER_ID"
++fi
++
++echo "=== create version ==="
++yc serverless function version create \
++  --function-name "$YDB_FN_NAME" \
++  --folder-id "$YC_FOLDER_ID" \
++  --runtime "$YDB_FN_RUNTIME" \
++  --entrypoint "$YDB_FN_ENTRYPOINT" \
++  --memory "$YDB_FN_MEMORY" \
++  --execution-timeout "$YDB_FN_TIMEOUT" \
++  --service-account-id "$YC_SERVICE_ACCOUNT_ID" \
++  "${CF_VERSION_SOURCE_ARGS[@]}" \
++  --environment "ADMIN_YDB_ENDPOINT=${ADMIN_YDB_ENDPOINT}" \
++  --environment "ADMIN_YDB_DATABASE=${ADMIN_YDB_DATABASE}" \
++  --environment "CLIENT_YDB_ENDPOINT=${CLIENT_YDB_ENDPOINT}" \
++  --environment "CLIENT_YDB_DATABASE=${CLIENT_YDB_DATABASE}"
++
++echo "=== allow unauthenticated invoke (TEST only) ==="
++yc serverless function allow-unauthenticated-invoke "$YDB_FN_NAME" --folder-id "$YC_FOLDER_ID" || true
++
++FN_ID=$(yc serverless function get --name "$YDB_FN_NAME" --folder-id "$YC_FOLDER_ID" --format json | jq -r '.id')
++FN_URL="https://functions.yandexcloud.net/${FN_ID}"
++
++# auto-write hint file for next steps
++echo "$FN_URL" > "$ROOT_DIR/deploy/test/.last-ydb-url"
++echo "$FN_ID" > "$ROOT_DIR/deploy/test/.last-ydb-id"
++
++echo ""
++echo "========================================="
++echo "✅ TEST YDB function deployed"
++echo "ID:  $FN_ID"
++echo "URL: $FN_URL"
++echo ""
++echo "Add to deploy/test/.env.test:"
++echo "  YDB_FUNCTION_URL=$FN_URL"
++echo "Then: npm run deploy:test:webapp"
++echo "========================================="
+diff --git a/deploy/test/deploy-webapp-cf.sh b/deploy/test/deploy-webapp-cf.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/deploy-webapp-cf.sh
+@@ -0,0 +1,91 @@
++#!/usr/bin/env bash
++# Deploy webapp as Yandex Cloud Function (TEST) — NO Serverless Containers
++# SPA zip may exceed 3.5MB → Object Storage path via cf-package-source.sh
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++# shellcheck disable=SC1091
++source "$ROOT_DIR/deploy/test/load-env.sh"
++# shellcheck disable=SC1091
++source "$ROOT_DIR/deploy/test/cf-package-source.sh"
++
++: "${WEBAPP_FN_NAME:=checklist-webapp-test}"
++: "${WEBAPP_FN_RUNTIME:=nodejs18}"
++: "${WEBAPP_FN_ENTRYPOINT:=index.handler}"
++: "${WEBAPP_FN_MEMORY:=512m}"
++: "${WEBAPP_FN_TIMEOUT:=30s}"
++
++ZIP_PATH="$ROOT_DIR/webapp-function/webapp-function.zip"
++
++echo "=== pack ==="
++bash "$ROOT_DIR/deploy/test/pack-webapp-fn.sh" "$ZIP_PATH"
++ls -lh "$ZIP_PATH"
++
++echo "=== resolve package source (direct vs Object Storage) ==="
++mapfile -t CF_VERSION_SOURCE_ARGS < <(cf_package_source_args "$ZIP_PATH" "webapp")
++if [[ ${#CF_VERSION_SOURCE_ARGS[@]} -lt 2 ]]; then
++  echo "❌ failed to resolve package source"
++  exit 1
++fi
++echo "   yc args: ${CF_VERSION_SOURCE_ARGS[*]}"
++
++echo "=== ensure function exists ==="
++if ! yc serverless function get --name "$WEBAPP_FN_NAME" --folder-id "$YC_FOLDER_ID" >/dev/null 2>&1; then
++  yc serverless function create --name "$WEBAPP_FN_NAME" --folder-id "$YC_FOLDER_ID"
++  echo "Created function $WEBAPP_FN_NAME"
++else
++  echo "Function $WEBAPP_FN_NAME already exists"
++fi
++
++ENV_FLAGS=(
++  --environment "APP_ENV=${APP_ENV:-test}"
++  --environment "NODE_ENV=production"
++  --environment "ALLOW_UNAUTH_API=${ALLOW_UNAUTH_API:-true}"
++  --environment "YDB_PROXY_TIMEOUT_MS=${YDB_PROXY_TIMEOUT_MS:-25000}"
++)
++if [[ -n "${YDB_FUNCTION_URL:-}" ]]; then
++  ENV_FLAGS+=(--environment "YDB_FUNCTION_URL=${YDB_FUNCTION_URL}")
++elif [[ -f "$ROOT_DIR/deploy/test/.last-ydb-url" ]]; then
++  # auto-pick last deployed ydb url if not set
++  AUTO_YDB=$(cat "$ROOT_DIR/deploy/test/.last-ydb-url")
++  ENV_FLAGS+=(--environment "YDB_FUNCTION_URL=${AUTO_YDB}")
++  echo "ℹ️  Using YDB_FUNCTION_URL from .last-ydb-url: $AUTO_YDB"
++fi
++if [[ -n "${CORS_ORIGIN:-}" ]]; then
++  ENV_FLAGS+=(--environment "CORS_ORIGIN=${CORS_ORIGIN}")
++fi
++
++echo "=== create version ==="
++yc serverless function version create \
++  --function-name "$WEBAPP_FN_NAME" \
++  --folder-id "$YC_FOLDER_ID" \
++  --runtime "$WEBAPP_FN_RUNTIME" \
++  --entrypoint "$WEBAPP_FN_ENTRYPOINT" \
++  --memory "$WEBAPP_FN_MEMORY" \
++  --execution-timeout "$WEBAPP_FN_TIMEOUT" \
++  --service-account-id "$YC_SERVICE_ACCOUNT_ID" \
++  "${CF_VERSION_SOURCE_ARGS[@]}" \
++  "${ENV_FLAGS[@]}"
++
++echo "=== public invoke (TEST only) ==="
++yc serverless function allow-unauthenticated-invoke "$WEBAPP_FN_NAME" --folder-id "$YC_FOLDER_ID" || true
++
++FN_ID=$(yc serverless function get --name "$WEBAPP_FN_NAME" --folder-id "$YC_FOLDER_ID" --format json | jq -r '.id')
++FN_URL="https://functions.yandexcloud.net/${FN_ID}"
++
++echo ""
++echo "========================================="
++echo "✅ TEST webapp Cloud Function deployed"
++echo "ID:  $FN_ID"
++echo "URL: $FN_URL"
++echo "Health: ${FN_URL}/health"
++echo "========================================="
++
++echo "$FN_URL" > "$ROOT_DIR/deploy/test/.last-webapp-url"
++echo "$FN_ID" > "$ROOT_DIR/deploy/test/.last-webapp-id"
++
++sleep 2
++code=$(curl -s -o /tmp/cf-health.json -w "%{http_code}" "${FN_URL}/health" || echo 000)
++echo "Health HTTP: $code"
++cat /tmp/cf-health.json 2>/dev/null || true
++echo ""
+diff --git a/deploy/test/deploy-webapp.sh b/deploy/test/deploy-webapp.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/deploy-webapp.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++# Compat shim → Cloud Function deploy
++set -euo pipefail
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++echo "ℹ️  Redirect: Serverless Containers → Cloud Function"
++exec bash "$ROOT_DIR/deploy/test/deploy-webapp-cf.sh"
+diff --git a/deploy/test/env.example b/deploy/test/env.example
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/env.example
+@@ -0,0 +1,49 @@
++# ============================================================
++# CheckList-1С — TEST deploy (Cloud Functions ONLY)
++# cp deploy/test/env.example deploy/test/.env.test
++# NEVER commit .env.test
++# ============================================================
++
++# --- Yandex Cloud ---
++YC_FOLDER_ID=b1gxxxxxxxxxxxxxxxx
++YC_SERVICE_ACCOUNT_ID=ajexxxxxxxxxxxxxxxx
++
++# --- Object Storage for CF packages (>3.5MB direct upload limit) ---
++# Required for ydb-function (ydb sdk zip is typically 10–40MB).
++# Bucket is auto-created if missing (SA needs storage admin/uploader).
++CF_PACKAGE_BUCKET=checklist-cf-packages-test
++CF_PACKAGE_PREFIX=cf-packages
++# CF_DIRECT_UPLOAD_MAX_BYTES=3500000
++
++# --- Webapp Cloud Function ---
++WEBAPP_FN_NAME=checklist-webapp-test
++WEBAPP_FN_RUNTIME=nodejs18
++WEBAPP_FN_MEMORY=512m
++WEBAPP_FN_TIMEOUT=30s
++APP_ENV=test
++VITE_SHOW_DEMO_PROFILES=true
++ALLOW_UNAUTH_API=true
++YDB_PROXY_TIMEOUT_MS=25000
++CORS_ORIGIN=*
++# WEBAPP_PUBLIC_URL=https://xxxxxx.apigw.yandexcloud.net
++DEPLOY_APIGW=1
++APIGW_NAME=checklist-webapp-test-gw
++
++# --- YDB Cloud Function ---
++YDB_FN_NAME=checklist-ydb-proxy-test
++YDB_FUNCTION_URL=
++# After deploy-ydb-fn.sh:
++# YDB_FUNCTION_URL=https://functions.yandexcloud.net/<ydb-fn-id>
++
++ADMIN_YDB_ENDPOINT=grpcs://ydb.serverless.yandexcloud.net:2135
++ADMIN_YDB_DATABASE=/ru-central1/<folder>/<db-admin>
++CLIENT_YDB_ENDPOINT=grpcs://ydb.serverless.yandexcloud.net:2135
++CLIENT_YDB_DATABASE=/ru-central1/<folder>/<db-client>
++
++# Optional MinIO
++MINIO_ENDPOINT=
++MINIO_BUCKET=
++MINIO_ACCESS_KEY=
++MINIO_SECRET_KEY=
++MINIO_PUBLIC_URL=
++APP_URL=
+diff --git a/deploy/test/load-env.sh b/deploy/test/load-env.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/load-env.sh
+@@ -0,0 +1,31 @@
++#!/usr/bin/env bash
++# Source deploy/test/.env.test
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++ENV_FILE="${ENV_FILE:-$ROOT_DIR/deploy/test/.env.test}"
++
++if [[ ! -f "$ENV_FILE" ]]; then
++  echo "❌ Env file not found: $ENV_FILE"
++  echo "   cp deploy/test/env.example deploy/test/.env.test  &&  edit values"
++  exit 1
++fi
++
++set -a
++# shellcheck disable=SC1090
++source "$ENV_FILE"
++set +a
++
++: "${YC_FOLDER_ID:?YC_FOLDER_ID required}"
++: "${YC_SERVICE_ACCOUNT_ID:?YC_SERVICE_ACCOUNT_ID required}"
++
++: "${WEBAPP_FN_NAME:=checklist-webapp-test}"
++: "${APP_ENV:=test}"
++: "${ALLOW_UNAUTH_API:=true}"
++: "${YDB_PROXY_TIMEOUT_MS:=25000}"
++: "${DEPLOY_APIGW:=1}"
++
++export PATH="${HOME}/yandex-cloud/bin:${PATH}"
++
++echo "✅ Loaded env from $ENV_FILE"
++echo "   folder=$YC_FOLDER_ID  webapp_fn=$WEBAPP_FN_NAME  app_env=$APP_ENV"
+diff --git a/deploy/test/pack-webapp-fn.sh b/deploy/test/pack-webapp-fn.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/pack-webapp-fn.sh
+@@ -0,0 +1,56 @@
++#!/usr/bin/env bash
++# Build SPA and pack webapp-function zip for Yandex Cloud Functions
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++# env optional for pack (no yc ids required for local pack)
++ENV_FILE="${ENV_FILE:-$ROOT_DIR/deploy/test/.env.test}"
++if [[ -f "$ENV_FILE" ]]; then
++  set -a
++  # shellcheck disable=SC1090
++  source "$ENV_FILE"
++  set +a
++fi
++
++FN_DIR="$ROOT_DIR/webapp-function"
++OUT_ZIP="${1:-$ROOT_DIR/webapp-function/webapp-function.zip}"
++WORK_DIR=$(mktemp -d)
++trap 'rm -rf "$WORK_DIR"' EXIT
++
++cd "$ROOT_DIR"
++
++echo "=== npm ci + build ==="
++if [[ -f package-lock.json ]]; then
++  npm ci --no-audit --no-fund
++else
++  npm install --no-audit --no-fund
++fi
++
++export VITE_SHOW_DEMO_PROFILES="${VITE_SHOW_DEMO_PROFILES:-true}"
++export VITE_APP_ENV="${APP_ENV:-test}"
++npm run build
++
++if [[ ! -d dist ]] || [[ ! -f dist/index.html ]]; then
++  echo "❌ dist/index.html missing after build"
++  exit 1
++fi
++
++echo "=== assemble function package ==="
++cp "$FN_DIR/index.js" "$FN_DIR/package.json" "$WORK_DIR/"
++cp -a dist "$WORK_DIR/dist"
++
++# size check — CF zip limit is 128MB (deploy), recommend < 30MB for test
++DIST_SIZE=$(du -sm "$WORK_DIR/dist" | cut -f1)
++echo "dist size: ${DIST_SIZE} MB"
++if [[ "$DIST_SIZE" -gt 100 ]]; then
++  echo "⚠️ dist is large for Cloud Function package (${DIST_SIZE}MB). Consider Object Storage + thin CF later."
++fi
++
++(
++  cd "$WORK_DIR"
++  # no node_modules needed (stdlib + fetch only)
++  zip -qr "$OUT_ZIP" index.js package.json dist
++)
++
++echo "✅ Packed: $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1))"
++ls -la "$OUT_ZIP"
+diff --git a/deploy/test/all.sh b/deploy/test/all.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/all.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++# Full TEST pipeline (Cloud Functions only — no Serverless Containers)
++set -euo pipefail
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++
++# 1) YDB proxy CF (if env has YDB endpoints)
++if [[ -f "$ROOT_DIR/deploy/test/.env.test" ]]; then
++  set -a
++  # shellcheck disable=SC1090
++  source "$ROOT_DIR/deploy/test/.env.test"
++  set +a
++fi
++
++if [[ -n "${ADMIN_YDB_ENDPOINT:-}" && -n "${ADMIN_YDB_DATABASE:-}" ]]; then
++  echo ">>> deploy YDB function"
++  bash "$ROOT_DIR/deploy/test/deploy-ydb-fn.sh"
++  # auto-wire YDB_FUNCTION_URL if deploy printed it — user may already have it in env
++fi
++
++echo ">>> deploy webapp Cloud Function"
++bash "$ROOT_DIR/deploy/test/deploy-webapp-cf.sh"
++
++if [[ "${DEPLOY_APIGW:-1}" == "1" ]]; then
++  echo ">>> API Gateway"
++  bash "$ROOT_DIR/deploy/test/deploy-apigw.sh" || echo "⚠️ API Gateway step skipped/failed"
++fi
++
++echo ">>> smoke"
++bash "$ROOT_DIR/deploy/test/smoke.sh"
+diff --git a/deploy/test/smoke.sh b/deploy/test/smoke.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/smoke.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++# Smoke against Cloud Function / API Gateway URL
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++# shellcheck disable=SC1091
++source "$ROOT_DIR/deploy/test/load-env.sh"
++
++BASE_URL="${1:-}"
++if [[ -z "$BASE_URL" && -f "$ROOT_DIR/deploy/test/.last-webapp-url" ]]; then
++  BASE_URL=$(cat "$ROOT_DIR/deploy/test/.last-webapp-url")
++fi
++if [[ -z "$BASE_URL" ]]; then
++  : "${WEBAPP_FN_NAME:=checklist-webapp-test}"
++  FN_ID=$(yc serverless function get --name "$WEBAPP_FN_NAME" --folder-id "$YC_FOLDER_ID" --format json | jq -r '.id')
++  BASE_URL="https://functions.yandexcloud.net/${FN_ID}"
++fi
++
++# normalize trailing slash
++BASE_URL="${BASE_URL%/}"
++
++echo "Smoke against $BASE_URL"
++fail=0
++check() {
++  local path="$1" expect="$2"
++  code=$(curl -s -o /tmp/smk.out -w "%{http_code}" "${BASE_URL}${path}" || echo 000)
++  if [[ "$code" == "$expect" ]]; then
++    echo "  OK  ${path:-/} → $code"
++  else
++    echo "  FAIL ${path:-/} → $code (want $expect)"
++    head -c 300 /tmp/smk.out || true
++    echo
++    fail=1
++  fi
++}
++
++check "/health" "200"
++check "/api/health" "200"
++check "/" "200"
++
++code=$(curl -s -o /tmp/smk-q.out -w "%{http_code}" -X POST "${BASE_URL}/api/query" \
++  -H 'Content-Type: application/json' \
++  -d '{"query":"SELECT 1 AS value;","orgType":"admin"}' || echo 000)
++echo "  INFO POST /api/query → $code"
++head -c 400 /tmp/smk-q.out 2>/dev/null; echo
++
++if [[ $fail -ne 0 ]]; then
++  echo "❌ Smoke failed"
++  exit 1
++fi
++echo "✅ Smoke passed"
+diff --git a/deploy/test/build-push.sh b/deploy/test/build-push.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/build-push.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++echo "DEPRECATED: Serverless Containers path removed from test flow."
++echo "Use: npm run deploy:test:webapp   (Cloud Function pack+deploy)"
++echo "     npm run deploy:test:pack     (zip only)"
++exit 1
+diff --git a/deploy/test/README.md b/deploy/test/README.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/README.md
+@@ -0,0 +1,75 @@
++# TEST deploy — Cloud Functions only
++
++| Компонент | Сервис |
++|---|---|
++| Webapp (SPA + `/api/query`) | Cloud Function `webapp-function/` |
++| YDB proxy | Cloud Function `ydb-function/` |
++| Пакеты > 3.5 MB | **Object Storage** (`CF_PACKAGE_BUCKET`) |
++| Публичный URL | API Gateway (опц.) |
++
++## Лимит 3.5 MB
++
++Прямой `--source-path` в `yc serverless function version create` принимает zip **≤ 3.5 MB**.  
++YDB SDK (`@ydbjs/*` + protobuf) почти всегда больше → скрипт:
++
++1. пакует zip  
++2. если size > 3.5MB → upload в `s3://$CF_PACKAGE_BUCKET/...`  
++3. создаёт version с `--package-bucket-name` + `--package-object-name`
++
++## 1. Env
++
++```bash
++cp deploy/test/env.example deploy/test/.env.test
++```
++
++Обязательно:
++
++```bash
++YC_FOLDER_ID=...
++YC_SERVICE_ACCOUNT_ID=...
++CF_PACKAGE_BUCKET=checklist-cf-packages-test   # имя bucket (латиница, уникально в облаке)
++
++ADMIN_YDB_ENDPOINT=...
++ADMIN_YDB_DATABASE=...
++CLIENT_YDB_ENDPOINT=...
++CLIENT_YDB_DATABASE=...
++```
++
++Роли SA (folder):
++
++- `serverless.functions.admin` (или editor)
++- `storage.editor` (или uploader + создание bucket)
++- `ydb.editor` / доступ к базам
++- `iam.serviceAccounts.user` (invoke as SA при API GW)
++
++Один раз вручную (если auto-create запрещён политикой):
++
++```bash
++yc storage bucket create \
++  --name checklist-cf-packages-test \
++  --folder-id "$YC_FOLDER_ID"
++```
++
++## 2. Deploy YDB
++
++```bash
++npm run deploy:test:ydb
++# → URL; допишите в .env.test:
++# YDB_FUNCTION_URL=https://functions.yandexcloud.net/<id>
++```
++
++## 3. Deploy webapp
++
++```bash
++npm run deploy:test:webapp
++npm run deploy:test:apigw   # optional
++npm run deploy:test:smoke
++```
++
++Или всё: `npm run deploy:test`
++
++## Local
++
++```bash
++npm run build && npm start   # Express — только локально
++```
+diff --git a/deploy/test/CHANGELOG-patch.md b/deploy/test/CHANGELOG-patch.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/CHANGELOG-patch.md
+@@ -0,0 +1,22 @@
++# Patch: Cloud Functions only (drop Serverless Containers for webapp)
++
++## Decision
++Webapp test/prod path on **Yandex Cloud Functions** only.  
++No Serverless Containers / Docker image for runtime.
++
++## Added
++- `webapp-function/index.js` — HTTP CF: static SPA + health + `/api/query` proxy
++- `deploy/test/pack-webapp-fn.sh` — vite build → zip with dist/
++- `deploy/test/deploy-webapp-cf.sh`
++- `deploy/test/api-gateway-test.yaml` + `deploy-apigw.sh`
++- updated smoke/all/env for CF URLs
++
++## Deprecated
++- Docker → Serverless Containers deploy for webapp
++- `build-push.sh` exits with message to use CF
++- `deploy-webapp.sh` redirects to `deploy-webapp-cf.sh`
++- Dockerfile / server.js kept for **local** only
++
++## Keep
++- `ydb-function/` as separate Cloud Function
++- `server.js` for local `npm start`
+diff --git a/deploy/test/api-gateway-test.yaml b/deploy/test/api-gateway-test.yaml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/api-gateway-test.yaml
+@@ -0,0 +1,73 @@
++# Yandex API Gateway — TEST
++# Substitute ${WEBAPP_FN_ID} and ${YDB_FN_ID} before create, or use deploy-apigw.sh
++openapi: 3.0.0
++info:
++  title: checklist-webapp-test
++  version: 0.1.0
++paths:
++  /health:
++    get:
++      x-yc-apigateway-integration:
++        type: cloud_functions
++        function_id: ${WEBAPP_FN_ID}
++        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
++      responses:
++        '200':
++          description: OK
++  /api/health:
++    get:
++      x-yc-apigateway-integration:
++        type: cloud_functions
++        function_id: ${WEBAPP_FN_ID}
++        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
++      responses:
++        '200':
++          description: OK
++  /api/query:
++    post:
++      x-yc-apigateway-integration:
++        type: cloud_functions
++        # Option A: through webapp CF (proxy)
++        function_id: ${WEBAPP_FN_ID}
++        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
++      responses:
++        '200':
++          description: YDB query result
++  /{path+}:
++    get:
++      x-yc-apigateway-integration:
++        type: cloud_functions
++        function_id: ${WEBAPP_FN_ID}
++        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
++      parameters:
++        - name: path
++          in: path
++          required: true
++          schema:
++            type: string
++      responses:
++        '200':
++          description: SPA asset or index
++    head:
++      x-yc-apigateway-integration:
++        type: cloud_functions
++        function_id: ${WEBAPP_FN_ID}
++        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
++      parameters:
++        - name: path
++          in: path
++          required: true
++          schema:
++            type: string
++      responses:
++        '200':
++          description: SPA
++  /:
++    get:
++      x-yc-apigateway-integration:
++        type: cloud_functions
++        function_id: ${WEBAPP_FN_ID}
++        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
++      responses:
++        '200':
++          description: SPA index
+diff --git a/deploy/test/deploy-apigw.sh b/deploy/test/deploy-apigw.sh
+new file mode 100755
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/test/deploy-apigw.sh
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bash
++# Create/update API Gateway pointing to webapp Cloud Function (TEST)
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++# shellcheck disable=SC1091
++source "$ROOT_DIR/deploy/test/load-env.sh"
++
++: "${WEBAPP_FN_NAME:=checklist-webapp-test}"
++: "${APIGW_NAME:=checklist-webapp-test-gw}"
++
++WEBAPP_FN_ID=$(yc serverless function get --name "$WEBAPP_FN_NAME" --folder-id "$YC_FOLDER_ID" --format json | jq -r '.id')
++if [[ -z "$WEBAPP_FN_ID" || "$WEBAPP_FN_ID" == "null" ]]; then
++  echo "❌ Deploy webapp CF first: npm run deploy:test:webapp"
++  exit 1
++fi
++
++SPEC_SRC="$ROOT_DIR/deploy/test/api-gateway-test.yaml"
++SPEC_OUT=$(mktemp)
++trap 'rm -f "$SPEC_OUT"' EXIT
++
++sed \
++  -e "s/\${WEBAPP_FN_ID}/$WEBAPP_FN_ID/g" \
++  -e "s/\${YC_SERVICE_ACCOUNT_ID}/$YC_SERVICE_ACCOUNT_ID/g" \
++  -e "s/\${YDB_FN_ID}/${YDB_FN_ID:-}/g" \
++  "$SPEC_SRC" > "$SPEC_OUT"
++
++if yc serverless api-gateway get --name "$APIGW_NAME" --folder-id "$YC_FOLDER_ID" >/dev/null 2>&1; then
++  echo "=== update API Gateway ==="
++  yc serverless api-gateway update \
++    --name "$APIGW_NAME" \
++    --folder-id "$YC_FOLDER_ID" \
++    --spec "$SPEC_OUT"
++else
++  echo "=== create API Gateway ==="
++  yc serverless api-gateway create \
++    --name "$APIGW_NAME" \
++    --folder-id "$YC_FOLDER_ID" \
++    --spec "$SPEC_OUT"
++fi
++
++DOMAIN=$(yc serverless api-gateway get --name "$APIGW_NAME" --folder-id "$YC_FOLDER_ID" --format json | jq -r '.domain')
++echo ""
++echo "========================================="
++echo "✅ API Gateway: https://${DOMAIN}"
++echo "Health: https://${DOMAIN}/health"
++echo "========================================="
++echo "https://${DOMAIN}" > "$ROOT_DIR/deploy/test/.last-webapp-url"
+diff --git a/webapp-function/index.js b/webapp-function/index.js
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/webapp-function/index.js
+@@ -0,0 +1,305 @@
++/**
++ * CheckList-1С — Webapp as Yandex Cloud Function (HTTP)
++ *
++ * - GET  /*           → static SPA from ./dist
++ * - GET  /health      → health JSON
++ * - POST /api/query   → proxy to YDB_FUNCTION_URL (or inline if YDB_* set and USE_INLINE_YDB=1)
++ *
++ * No Serverless Containers. PORT listen not used.
++ */
++'use strict';
++
++const fs = require('fs');
++const path = require('path');
++
++const DIST = path.join(__dirname, 'dist');
++const YDB_FUNCTION_URL = (process.env.YDB_FUNCTION_URL || '').replace(/\/$/, '');
++const YDB_PROXY_TIMEOUT_MS = Number(process.env.YDB_PROXY_TIMEOUT_MS) || 25000;
++const ALLOW_UNAUTH_API = process.env.ALLOW_UNAUTH_API !== 'false';
++const APP_ENV = process.env.APP_ENV || 'test';
++const CACHE_MAX_AGE = process.env.STATIC_CACHE_MAX_AGE || '3600';
++
++const MIME = {
++  '.html': 'text/html; charset=utf-8',
++  '.js': 'application/javascript; charset=utf-8',
++  '.css': 'text/css; charset=utf-8',
++  '.json': 'application/json; charset=utf-8',
++  '.svg': 'image/svg+xml',
++  '.png': 'image/png',
++  '.jpg': 'image/jpeg',
++  '.jpeg': 'image/jpeg',
++  '.webp': 'image/webp',
++  '.ico': 'image/x-icon',
++  '.woff': 'font/woff',
++  '.woff2': 'font/woff2',
++  '.map': 'application/json',
++  '.txt': 'text/plain; charset=utf-8',
++};
++
++function corsHeaders() {
++  return {
++    'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*',
++    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
++    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
++  };
++}
++
++function json(statusCode, obj, extraHeaders = {}) {
++  return {
++    statusCode,
++    headers: {
++      'Content-Type': 'application/json; charset=utf-8',
++      ...corsHeaders(),
++      ...extraHeaders,
++    },
++    body: JSON.stringify(obj),
++  };
++}
++
++function normalizePath(raw) {
++  let p = raw || '/';
++  try {
++    // API Gateway may pass full URL
++    if (p.startsWith('http')) {
++      p = new URL(p).pathname;
++    }
++  } catch (_) {}
++  // strip query
++  const q = p.indexOf('?');
++  if (q !== -1) p = p.slice(0, q);
++  if (!p.startsWith('/')) p = '/' + p;
++  // prevent path traversal
++  p = path.posix.normalize(p);
++  if (p.includes('..')) p = '/';
++  return p;
++}
++
++function parseBody(event) {
++  if (event.body == null || event.body === '') return {};
++  let raw = event.body;
++  if (event.isBase64Encoded) {
++    raw = Buffer.from(raw, 'base64').toString('utf8');
++  }
++  if (typeof raw !== 'string') return raw;
++  try {
++    return JSON.parse(raw);
++  } catch {
++    return { _raw: raw };
++  }
++}
++
++function getHeader(event, name) {
++  const h = event.headers || {};
++  const lower = name.toLowerCase();
++  for (const [k, v] of Object.entries(h)) {
++    if (k.toLowerCase() === lower) return v;
++  }
++  return undefined;
++}
++
++function safeJoinDist(urlPath) {
++  const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\//, '');
++  const full = path.normalize(path.join(DIST, rel));
++  if (!full.startsWith(DIST)) return null;
++  return full;
++}
++
++function serveStatic(urlPath) {
++  let filePath = safeJoinDist(urlPath);
++  if (!filePath) {
++    return json(400, { error: 'Invalid path' });
++  }
++
++  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
++    // SPA fallback
++    filePath = path.join(DIST, 'index.html');
++  }
++
++  if (!fs.existsSync(filePath)) {
++    return json(500, {
++      error: 'dist/ not packaged. Build SPA and run pack-webapp-fn.sh',
++    });
++  }
++
++  const ext = path.extname(filePath).toLowerCase();
++  const mime = MIME[ext] || 'application/octet-stream';
++  const buf = fs.readFileSync(filePath);
++  const isText =
++    mime.startsWith('text/') ||
++    mime.includes('javascript') ||
++    mime.includes('json') ||
++    mime.includes('svg') ||
++    mime.includes('xml');
++
++  const headers = {
++    'Content-Type': mime,
++    ...corsHeaders(),
++  };
++
++  // cache hashed assets; no-cache HTML
++  if (ext === '.html') {
++    headers['Cache-Control'] = 'no-cache';
++  } else if (urlPath.includes('/assets/')) {
++    headers['Cache-Control'] = `public, max-age=${CACHE_MAX_AGE}, immutable`;
++  } else {
++    headers['Cache-Control'] = `public, max-age=${CACHE_MAX_AGE}`;
++  }
++
++  if (isText) {
++    return {
++      statusCode: 200,
++      headers,
++      body: buf.toString('utf8'),
++    };
++  }
++
++  return {
++    statusCode: 200,
++    headers,
++    isBase64Encoded: true,
++    body: buf.toString('base64'),
++  };
++}
++
++async function proxyYdb(event) {
++  if (!YDB_FUNCTION_URL) {
++    return json(503, {
++      error:
++        'YDB_FUNCTION_URL is not set on webapp function. Deploy ydb-function and set env.',
++      columns: [],
++      rows: [],
++    });
++  }
++
++  if (!ALLOW_UNAUTH_API && !getHeader(event, 'authorization')) {
++    return json(401, { error: 'Unauthorized', columns: [], rows: [] });
++  }
++
++  const body = parseBody(event);
++  if (!body.query || typeof body.query !== 'string') {
++    return json(400, {
++      error: 'Missing "query" field in request body',
++      columns: [],
++      rows: [],
++    });
++  }
++
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), YDB_PROXY_TIMEOUT_MS);
++
++  try {
++    // Node 18+ global fetch on CF runtime
++    const upstream = await fetch(YDB_FUNCTION_URL, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        ...(getHeader(event, 'authorization')
++          ? { Authorization: getHeader(event, 'authorization') }
++          : {}),
++      },
++      body: JSON.stringify({
++        query: body.query,
++        orgType: body.orgType || 'client',
++        params: body.params || {},
++      }),
++      signal: controller.signal,
++    });
++
++    const text = await upstream.text();
++    let data;
++    try {
++      data = JSON.parse(text);
++    } catch {
++      data = { error: text || `Upstream HTTP ${upstream.status}` };
++    }
++
++    // nested CF/API Gateway envelope
++    if (data && typeof data.body === 'string' && data.statusCode) {
++      try {
++        data = JSON.parse(data.body);
++      } catch (_) {}
++    }
++
++    return json(upstream.ok ? 200 : upstream.status || 502, {
++      columns: data.columns || [],
++      rows: data.rows || [],
++      error: data.error,
++      stats: data.stats,
++      success: data.success,
++    });
++  } catch (err) {
++    const message =
++      err?.name === 'AbortError'
++        ? `YDB proxy timeout after ${YDB_PROXY_TIMEOUT_MS}ms`
++        : err?.message || 'YDB proxy failed';
++    console.error(JSON.stringify({ level: 'error', msg: 'ydb_proxy', error: message }));
++    return json(502, { error: message, columns: [], rows: [] });
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++exports.handler = async function handler(event, context) {
++  const method = (
++    event.httpMethod ||
++    event.requestContext?.httpMethod ||
++    event.requestContext?.http?.method ||
++    'GET'
++  ).toUpperCase();
++
++  const urlPath = normalizePath(
++    event.path ||
++      event.url ||
++      event.requestContext?.http?.path ||
++      event.params?.path ||
++      '/'
++  );
++
++  // API Gateway may strip prefix — support rawPath
++  const rawPath = normalizePath(event.rawPath || urlPath);
++
++  console.log(
++    JSON.stringify({
++      level: 'info',
++      msg: 'request',
++      method,
++      path: rawPath,
++      requestId: context?.requestId,
++      env: APP_ENV,
++    })
++  );
++
++  if (method === 'OPTIONS') {
++    return {
++      statusCode: 204,
++      headers: corsHeaders(),
++      body: '',
++    };
++  }
++
++  if (rawPath === '/health' || rawPath === '/api/health') {
++    return json(200, {
++      status: 'ok',
++      service: 'checklist-webapp-cf',
++      runtime: 'cloud-function',
++      timestamp: new Date().toISOString(),
++      appEnv: APP_ENV,
++      ydbProxy: Boolean(YDB_FUNCTION_URL),
++      requestId: context?.requestId,
++    });
++  }
++
++  if (rawPath === '/api/query' && method === 'POST') {
++    return proxyYdb(event);
++  }
++
++  if (method === 'GET' || method === 'HEAD') {
++    const res = serveStatic(rawPath);
++    if (method === 'HEAD') {
++      return { ...res, body: '' };
++    }
++    return res;
++  }
++
++  return json(405, { error: `Method ${method} not allowed` });
++};
+diff --git a/webapp-function/package.json b/webapp-function/package.json
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/webapp-function/package.json
+@@ -0,0 +1,10 @@
++{
++  "name": "checklist-webapp-cf",
++  "version": "0.1.0",
++  "private": true,
++  "description": "CheckList-1С SPA served as Yandex Cloud Function (HTTP)",
++  "main": "index.js",
++  "engines": {
++    "node": ">=18"
++  }
++}

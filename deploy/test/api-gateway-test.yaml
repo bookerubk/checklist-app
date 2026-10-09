@@ -1,0 +1,73 @@
+# Yandex API Gateway — TEST
+# Substitute ${WEBAPP_FN_ID} and ${YDB_FN_ID} before create, or use deploy-apigw.sh
+openapi: 3.0.0
+info:
+  title: checklist-webapp-test
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${WEBAPP_FN_ID}
+        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
+      responses:
+        '200':
+          description: OK
+  /api/health:
+    get:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${WEBAPP_FN_ID}
+        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
+      responses:
+        '200':
+          description: OK
+  /api/query:
+    post:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        # Option A: through webapp CF (proxy)
+        function_id: ${WEBAPP_FN_ID}
+        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
+      responses:
+        '200':
+          description: YDB query result
+  /{path+}:
+    get:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${WEBAPP_FN_ID}
+        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SPA asset or index
+    head:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${WEBAPP_FN_ID}
+        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SPA
+  /:
+    get:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${WEBAPP_FN_ID}
+        service_account_id: ${YC_SERVICE_ACCOUNT_ID}
+      responses:
+        '200':
+          description: SPA index

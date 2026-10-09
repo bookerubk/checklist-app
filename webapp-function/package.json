@@ -1,0 +1,10 @@
+{
+  "name": "checklist-webapp-cf",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CheckList-1С SPA served as Yandex Cloud Function (HTTP)",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  }
+}

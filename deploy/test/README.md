@@ -1,72 +1,75 @@
-# TEST deploy — CheckList-1С (Yandex Cloud)
+# TEST deploy — Cloud Functions only
 
-Целевой контур для **тестового** деплоя webapp:
-
-| Компонент | Сервис Yandex Cloud |
+| Компонент | Сервис |
 |---|---|
-| Webapp (SPA + Express) | **Serverless Containers** |
-| YDB proxy | **Cloud Functions** |
-| Образ | **Container Registry** |
+| Webapp (SPA + `/api/query`) | Cloud Function `webapp-function/` |
+| YDB proxy | Cloud Function `ydb-function/` |
+| Пакеты > 3.5 MB | **Object Storage** (`CF_PACKAGE_BUCKET`) |
+| Публичный URL | API Gateway (опц.) |
 
-> Секреты **не** коммитятся. Старые скрипты `deploy-final.sh` / `fix-port-and-deploy.sh` содержат hardcoded secrets — **не использовать** для новых выкладок.
+## Лимит 3.5 MB
 
-## 0. Prerequisites
+Прямой `--source-path` в `yc serverless function version create` принимает zip **≤ 3.5 MB**.  
+YDB SDK (`@ydbjs/*` + protobuf) почти всегда больше → скрипт:
 
-- `yc` CLI залогинен (`yc config list`)
-- Docker (buildx / linux/amd64)
-- `jq`, `curl`, `zip`, `npm`
-- Folder, Registry, Service Account с ролями:
-  - `container-registry.images.pusher`
-  - `serverless.containers.editor` / `serverless.functions.editor`
-  - `ydb.editor` (для function SA)
-  - `iam.serviceAccounts.user` (при необходимости)
+1. пакует zip  
+2. если size > 3.5MB → upload в `s3://$CF_PACKAGE_BUCKET/...`  
+3. создаёт version с `--package-bucket-name` + `--package-object-name`
 
 ## 1. Env
 
 ```bash
 cp deploy/test/env.example deploy/test/.env.test
-# заполнить YC_FOLDER_ID, YC_REGISTRY_ID, YC_SERVICE_ACCOUNT_ID, YDB_*
 ```
 
-## 2. (Опционально) YDB function
+Обязательно:
+
+```bash
+YC_FOLDER_ID=...
+YC_SERVICE_ACCOUNT_ID=...
+CF_PACKAGE_BUCKET=checklist-cf-packages-test   # имя bucket (латиница, уникально в облаке)
+
+ADMIN_YDB_ENDPOINT=...
+ADMIN_YDB_DATABASE=...
+CLIENT_YDB_ENDPOINT=...
+CLIENT_YDB_DATABASE=...
+```
+
+Роли SA (folder):
+
+- `serverless.functions.admin` (или editor)
+- `storage.editor` (или uploader + создание bucket)
+- `ydb.editor` / доступ к базам
+- `iam.serviceAccounts.user` (invoke as SA при API GW)
+
+Один раз вручную (если auto-create запрещён политикой):
+
+```bash
+yc storage bucket create \
+  --name checklist-cf-packages-test \
+  --folder-id "$YC_FOLDER_ID"
+```
+
+## 2. Deploy YDB
 
 ```bash
 npm run deploy:test:ydb
-# скопировать выданный YDB_FUNCTION_URL в .env.test
+# → URL; допишите в .env.test:
+# YDB_FUNCTION_URL=https://functions.yandexcloud.net/<id>
 ```
 
-## 3. Webapp: build + push + deploy
+## 3. Deploy webapp
 
 ```bash
-npm run deploy:test
-# или по шагам:
-npm run deploy:test:build
 npm run deploy:test:webapp
+npm run deploy:test:apigw   # optional
 npm run deploy:test:smoke
 ```
 
-## 4. Локальная проверка server + proxy
+Или всё: `npm run deploy:test`
+
+## Local
 
 ```bash
-npm run build
-YDB_FUNCTION_URL=https://functions.yandexcloud.net/<id> PORT=8080 npm start
-curl -s localhost:8080/health | jq .
-curl -s -X POST localhost:8080/api/query \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"SELECT 1 AS value;","orgType":"admin"}' | jq .
+npm run build && npm start   # Express — только локально
 ```
-
-## Архитектура test
-
-```
-Browser
-  → Serverless Container (Express: static dist + POST /api/query)
-      → Cloud Function (YDB proxy)
-          → Managed YDB (admin / client)
-```
-
-## Важно для test
-
-- `allow-unauthenticated-invoke` включён **только для test**.
-- `ALLOW_UNAUTH_API=true` — без JWT на `/api/query` (закрыть перед prod).
-- MinIO secrets только через `.env.test` / Lockbox, не в git.
