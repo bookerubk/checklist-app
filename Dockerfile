@@ -1,33 +1,40 @@
-# Этап 1: Сборка
-FROM node:20-alpine AS builder
+# syntax=docker/dockerfile:1.6
+# CheckList-1С webapp — Yandex Serverless Containers (test/prod)
 
+# ---------- build ----------
+FROM node:20-alpine AS builder
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
-COPY . .
+COPY index.html vite.config.ts tsconfig.json metadata.json ./
+COPY public ./public
+COPY src ./src
+
+ARG VITE_SHOW_DEMO_PROFILES=true
+ARG VITE_APP_ENV=test
+ENV VITE_SHOW_DEMO_PROFILES=$VITE_SHOW_DEMO_PROFILES
+ENV VITE_APP_ENV=$VITE_APP_ENV
+
 RUN npm run build
 
-# Этап 2: Запуск
-FROM node:20-alpine
-
+# ---------- runtime ----------
+FROM node:20-alpine AS runtime
 WORKDIR /app
 
-# Копируем package.json и устанавливаем production зависимости
-COPY package*.json ./
-RUN npm install --only=production
+ENV NODE_ENV=production
+ENV PORT=8080
+ENV APP_ENV=test
 
-# Копируем собранное приложение
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund \
+  && npm cache clean --force
+
 COPY --from=builder /app/dist ./dist
-
-# Копируем server.js
 COPY server.js ./
 
-# Устанавливаем express (если не установлен)
-RUN npm install express dotenv --save-prod 2>/dev/null || true
-
+# Serverless Containers: listen 0.0.0.0:8080
 EXPOSE 8080
-
-# Запуск сервера
+USER node
 CMD ["node", "server.js"]

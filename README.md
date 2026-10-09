@@ -1,20 +1,37 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# CheckList-1С
 
-# Run and deploy your AI Studio app
+Сервис автоматизации контроля качества, операционных проверок и фотоотчётов для HoReCa  
+(Yandex Serverless Containers + Managed YDB + MinIO + DataLens + Telegram).
 
-This contains everything you need to run your app locally.
+## Local
 
-View your app in AI Studio: https://ai.studio/apps/ceff1c1d-318a-4f38-a0b9-57bb80f8261f
+```bash
+npm install
+cp .env.example .env.local   # optional
+npm run dev                  # http://localhost:3000
+```
 
-## Run Locally
+Production-like local:
 
-**Prerequisites:**  Node.js
+```bash
+npm run build
+PORT=8080 npm start
+curl localhost:8080/health
+```
 
+## TEST deploy (Yandex Cloud)
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+См. **[deploy/test/README.md](deploy/test/README.md)**.
+
+```bash
+cp deploy/test/env.example deploy/test/.env.test
+# fill YC_* and YDB_*
+npm run deploy:test
+```
+
+## Stack
+
+- React 19 + TypeScript + Vite + Tailwind
+- Express (`server.js`) for SPA + `/api/query` proxy
+- YDB Cloud Function (`ydb-function/`)
+- Docker → Yandex Serverless Containers

@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# DEPRECATED: use deploy/test/*.sh — this file hardcodes secrets. Do not run in production.
+# See deploy/test/README.md
 
 export PATH="$HOME/yandex-cloud/bin:$PATH"
 

@@ -4,7 +4,14 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+.env
+.env.*
 !.env.example
-!.env.productionhoreca-registry.tar
+deploy/test/.env.test
+*.tar
 horeca-registry.tar
+.idea/
+.vscode/
+tmp/
+*.zip
+!ydb-function/ydb-function.zip
