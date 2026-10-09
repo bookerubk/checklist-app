@@ -1,0 +1,6 @@
+{
+  "name": "CheckList-1С",
+  "description": "Сервис автоматизации контроля качества, операционных проверок и фотоотчетов для HoReCa на базе Yandex Serverless Containers, Managed Service for YDB, MinIO S3 (VPS), DataLens и Telegram",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
