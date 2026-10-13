@@ -1,21 +1,22 @@
 # cloud.ru Evolution API Gateway — TEST
 # Backend: Yandex Cloud Function (HTTP public invoke)
-#   https://functions.yandexcloud.net/${WEBAPP_FN_ID}/...
 #
-# Подстановка: deploy-apigw-cloudru.sh или вручную
+# CRITICAL: Yandex CF does NOT accept paths after function id:
+#   https://functions.yandexcloud.net/<id>/health  → 400 invalid functionID
+# Path must be passed as query ?__path=... or header X-Original-Path.
+# Upstream host = functions.yandexcloud.net, path = /${WEBAPP_FN_ID}?__path=<route>
+#
+# Подстановка: deploy-apigw-cloudru.sh
 #   ${WEBAPP_FN_ID}  — id webapp Cloud Function (Yandex)
 #
-# Создание в консоли cloud.ru:
-#   Разработка → API Gateway → Создать API-шлюз → загрузить этот YAML
-#
-# Важно: у Yandex CF должен быть allow-unauthenticated-invoke (test).
+# Создание: Разработка → API Gateway → Создать → загрузить YAML
 openapi: 3.0.0
 info:
   title: checklist-webapp-test
-  version: 0.1.0
+  version: 0.1.1
   description: >
     Proxy SPA + /api/query на Yandex Cloud Function.
-    Functions и YDB остаются в Yandex Cloud; публичная точка входа — cloud.ru Evolution API Gateway.
+    Path передаётся через ?__path= (Yandex CF не поддерживает path в URL).
 
 paths:
   /health:
@@ -27,7 +28,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /health
-            forwarded_to: /${WEBAPP_FN_ID}/health
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/health
       responses:
         "200":
           description: OK
@@ -41,7 +42,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /api/health
-            forwarded_to: /${WEBAPP_FN_ID}/api/health
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/api/health
       responses:
         "200":
           description: OK
@@ -55,7 +56,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /api/query
-            forwarded_to: /${WEBAPP_FN_ID}/api/query
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/api/query
       responses:
         "200":
           description: YDB query result
@@ -69,7 +70,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /
-            forwarded_to: /${WEBAPP_FN_ID}/
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/
       responses:
         "200":
           description: SPA index
@@ -80,15 +81,14 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /
-            forwarded_to: /${WEBAPP_FN_ID}/
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/
       responses:
         "200":
           description: SPA
 
-  # Catch-all для SPA assets и client-side routes.
-  # Evolution: wildcard в URI proxy — см. docs ( /path* ).
-  # Если импорт OpenAPI не создаст wildcard-правило, добавьте вручную
-  # правило «Маршрутизация» с URI proxy /* → backend /${WEBAPP_FN_ID}/*
+  # Catch-all SPA assets / client routes.
+  # If OpenAPI import does not create wildcard, add manually in console:
+  #   URI proxy /*  →  /${WEBAPP_FN_ID}?__path=$uri
   /{path}:
     get:
       operationId: spaPath
@@ -104,7 +104,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /{path}
-            forwarded_to: /${WEBAPP_FN_ID}/{path}
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/{path}
       responses:
         "200":
           description: SPA asset or index
@@ -121,7 +121,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /{path}
-            forwarded_to: /${WEBAPP_FN_ID}/{path}
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/{path}
       responses:
         "200":
           description: SPA
@@ -139,7 +139,7 @@ paths:
       x-cloud-proxy-rewrite:
         uris:
           - forwarded_from: /{path}
-            forwarded_to: /${WEBAPP_FN_ID}/{path}
+            forwarded_to: /${WEBAPP_FN_ID}?__path=/{path}
       responses:
         "204":
           description: CORS
@@ -148,13 +148,12 @@ components:
   x-cloud-upstreams:
     WebappYcFn:
       name: WebappYcFn
-      description: Yandex Cloud Function webapp (public HTTP invoke)
+      description: Yandex Cloud Function webapp (public HTTP invoke, path via ?__path=)
       type: url
       scheme: https
       nodes:
         - host: functions.yandexcloud.net
           weight: 1
-      # CF timeout до 30s — запас на cold start + YDB proxy
       timeout:
         connect: 5
         send: 10

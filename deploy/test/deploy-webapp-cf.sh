@@ -78,14 +78,18 @@ echo "========================================="
 echo "✅ TEST webapp Cloud Function deployed"
 echo "ID:  $FN_ID"
 echo "URL: $FN_URL"
-echo "Health: ${FN_URL}/health"
+echo "Health: ${FN_URL}?__path=/health"
+echo "  (Yandex CF rejects paths after function id — use ?__path= or API Gateway)"
 echo "========================================="
 
 echo "$FN_URL" > "$ROOT_DIR/deploy/test/.last-webapp-url"
 echo "$FN_ID" > "$ROOT_DIR/deploy/test/.last-webapp-id"
 
 sleep 2
-code=$(curl -s -o /tmp/cf-health.json -w "%{http_code}" "${FN_URL}/health" || echo 000)
+# Direct invoke has NO URL path support:
+#   /<id>/health → 400 invalid functionID
+# Path via query ?__path= (cloud.ru Evolution) or Yandex API Gateway integration.
+code=$(curl -s -o /tmp/cf-health.json -w "%{http_code}" "${FN_URL}?__path=/health" || echo 000)
 echo "Health HTTP: $code"
 cat /tmp/cf-health.json 2>/dev/null || true
 echo ""

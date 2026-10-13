@@ -24,13 +24,32 @@ BASE_URL="${BASE_URL%/}"
 
 echo "Smoke against $BASE_URL"
 fail=0
+
+# Yandex CF public invoke does not support URL paths after function id.
+# Gateway URLs (apigw.*) keep normal paths; direct CF uses ?__path=.
+url_for() {
+  local path="${1:-/}"
+  if [[ "$BASE_URL" == *functions.yandexcloud.net* ]]; then
+    # encode path as query — path "/" stays as /
+    printf '%s?__path=%s' "$BASE_URL" "$path"
+  else
+    if [[ "$path" == "/" ]]; then
+      printf '%s/' "$BASE_URL"
+    else
+      printf '%s%s' "$BASE_URL" "$path"
+    fi
+  fi
+}
+
 check() {
   local path="$1" expect="$2"
-  code=$(curl -s -o /tmp/smk.out -w "%{http_code}" "${BASE_URL}${path}" || echo 000)
+  local url
+  url=$(url_for "$path")
+  code=$(curl -s -o /tmp/smk.out -w "%{http_code}" "$url" || echo 000)
   if [[ "$code" == "$expect" ]]; then
     echo "  OK  ${path:-/} → $code"
   else
-    echo "  FAIL ${path:-/} → $code (want $expect)"
+    echo "  FAIL ${path:-/} → $code (want $expect)  url=$url"
     head -c 300 /tmp/smk.out || true
     echo
     fail=1
@@ -42,7 +61,7 @@ check "/api/health" "200"
 check "/" "200"
 
 # Static assets must NOT be SPA fallback (HTML). Parse hashed assets from index.html.
-INDEX_HTML=$(curl -sS "${BASE_URL}/" || true)
+INDEX_HTML=$(curl -sS "$(url_for /)" || true)
 JS_PATH=$(printf '%s' "$INDEX_HTML" | sed -n 's/.*src="\(\/assets\/[^"]*\.js\)".*/\1/p' | head -1)
 CSS_PATH=$(printf '%s' "$INDEX_HTML" | sed -n 's/.*href="\(\/assets\/[^"]*\.css\)".*/\1/p' | head -1)
 
@@ -54,8 +73,10 @@ check_asset() {
     return
   fi
   local ctype size code
-  code=$(curl -sS -o /tmp/smk-asset.bin -w "%{http_code}" "${BASE_URL}${path}" || echo 000)
-  ctype=$(curl -sS -I "${BASE_URL}${path}" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2; exit}')
+  local aurl
+  aurl=$(url_for "$path")
+  code=$(curl -sS -o /tmp/smk-asset.bin -w "%{http_code}" "$aurl" || echo 000)
+  ctype=$(curl -sS -I "$aurl" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2; exit}')
   size=$(wc -c < /tmp/smk-asset.bin | tr -d ' ')
   # reject HTML SPA fallback
   if head -c 20 /tmp/smk-asset.bin | grep -qi '<!doctype\|<html'; then
@@ -94,11 +115,27 @@ else
   fail=1
 fi
 
-code=$(curl -s -o /tmp/smk-q.out -w "%{http_code}" -X POST "${BASE_URL}/api/query" \
+code=$(curl -sS --max-time 45 -o /tmp/smk-q.out -w "%{http_code}" -X POST "$(url_for /api/query)" \
   -H 'Content-Type: application/json' \
   -d '{"query":"SELECT 1 AS value;","orgType":"admin"}' || echo 000)
 echo "  INFO POST /api/query → $code"
 head -c 400 /tmp/smk-q.out 2>/dev/null; echo
+if [[ "$code" != "200" ]]; then
+  if [[ "${SMOKE_QUERY_SOFT:-0}" == "1" ]]; then
+    echo "  WARN query not 200 (SMOKE_QUERY_SOFT=1)"
+  else
+    echo "  FAIL POST /api/query (want 200) — M0 blocked"
+    fail=1
+  fi
+else
+  # must look like JSON with columns or success
+  if ! grep -qE '"success":\s*true|"columns"' /tmp/smk-q.out 2>/dev/null; then
+    echo "  FAIL /api/query body unexpected"
+    fail=1
+  else
+    echo "  OK  POST /api/query body"
+  fi
+fi
 
 if [[ $fail -ne 0 ]]; then
   echo "❌ Smoke failed"

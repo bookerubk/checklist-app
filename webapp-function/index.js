@@ -20,7 +20,7 @@ const path = require('path');
 
 const DIST = path.join(__dirname, 'dist');
 const YDB_FUNCTION_URL = (process.env.YDB_FUNCTION_URL || '').replace(/\/$/, '');
-const YDB_PROXY_TIMEOUT_MS = Number(process.env.YDB_PROXY_TIMEOUT_MS) || 25000;
+const YDB_PROXY_TIMEOUT_MS = Number(process.env.YDB_PROXY_TIMEOUT_MS) || 28000;
 const ALLOW_UNAUTH_API = process.env.ALLOW_UNAUTH_API !== 'false';
 const APP_ENV = process.env.APP_ENV || 'test';
 const CACHE_MAX_AGE = process.env.STATIC_CACHE_MAX_AGE || '3600';
@@ -108,13 +108,40 @@ function normalizePath(raw) {
 }
 
 /**
- * Resolve real request path across Yandex API Gateway formats:
- * - default: url = actual, path = OpenAPI spec path, pathParams = captures
- * - AWS v1: path = actual, pathParameters = captures
- * - AWS v2: rawPath = actual, pathParameters = captures
+ * Resolve real request path across:
+ * - Yandex API Gateway: url / pathParams (path is often OpenAPI template)
+ * - AWS v1/v2: path / rawPath
+ * - Direct CF invoke (functions.yandexcloud.net/<id>): path is empty —
+ *   Yandex rejects URL paths after function id, so external gateways
+ *   (e.g. cloud.ru Evolution) must pass path via:
+ *     • query  ?__path=/health   or  ?path=/health
+ *     • header X-Original-Path / X-Forwarded-Uri / X-Rewrite-Path
  */
 function resolveRequestPath(event) {
   if (!event || typeof event !== 'object') return '/';
+
+  // 0) External HTTP proxy → Yandex CF (no path on invoke URL)
+  const q =
+    event.queryStringParameters ||
+    event.query ||
+    event.multiValueQueryStringParameters ||
+    {};
+  const qPath = q.__path || q.path || (Array.isArray(q.__path) ? q.__path[0] : null);
+  if (qPath != null && String(qPath) !== '') {
+    return normalizePath(String(qPath));
+  }
+  const hdrPath =
+    getHeader(event, 'x-original-path') ||
+    getHeader(event, 'x-rewrite-path') ||
+    getHeader(event, 'x-forwarded-uri') ||
+    getHeader(event, 'x-envoy-original-path');
+  if (hdrPath != null && String(hdrPath) !== '') {
+    let p = String(hdrPath);
+    // X-Forwarded-Uri may be full path+query
+    const qidx = p.indexOf('?');
+    if (qidx !== -1) p = p.slice(0, qidx);
+    return normalizePath(p);
+  }
 
   // 1) Greedy / path parameters (/{path+}, /{proxy+}, …)
   const paramCandidates = [
@@ -332,24 +359,46 @@ async function proxyYdb(event) {
     const text = await upstream.text();
     let data;
     try {
-      data = JSON.parse(text);
+      data = text ? JSON.parse(text) : {};
     } catch {
       data = { error: text || `Upstream HTTP ${upstream.status}` };
     }
 
-    // nested CF/API Gateway envelope
-    if (data && typeof data.body === 'string' && data.statusCode) {
+    // nested CF envelope { statusCode, body: "<json>" }
+    let nestedStatus = null;
+    if (data && typeof data.body === 'string' && data.statusCode != null) {
+      nestedStatus = Number(data.statusCode) || null;
       try {
         data = JSON.parse(data.body);
-      } catch (_) {}
+      } catch (_) {
+        data = { error: String(data.body).slice(0, 500) };
+      }
     }
 
-    return json(upstream.ok ? 200 : upstream.status || 502, {
+    let status = nestedStatus || (upstream.ok ? 200 : upstream.status || 502);
+    if (data.error && status === 200 && data.success !== true) {
+      status = 502;
+    }
+    if (!upstream.ok && !data.error) {
+      data.error = `YDB upstream HTTP ${upstream.status}${text ? ': ' + text.slice(0, 300) : ''}`;
+    }
+    console.log(
+      JSON.stringify({
+        level: status >= 400 ? 'error' : 'info',
+        msg: 'ydb_proxy_result',
+        upstreamStatus: upstream.status,
+        status,
+        error: data.error || null,
+        rows: Array.isArray(data.rows) ? data.rows.length : 0,
+      })
+    );
+    return json(status, {
       columns: data.columns || [],
       rows: data.rows || [],
       error: data.error,
       stats: data.stats,
       success: data.success,
+      upstreamStatus: upstream.status,
     });
   } catch (err) {
     const message =
