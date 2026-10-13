@@ -14,7 +14,10 @@
     "deploy:test:webapp": "bash deploy/test/deploy-webapp.sh",
     "deploy:test:ydb": "bash deploy/test/deploy-ydb-fn.sh",
     "deploy:test:smoke": "bash deploy/test/smoke.sh",
-    "deploy:test": "bash deploy/test/all.sh"
+    "deploy:test": "bash deploy/test/all.sh",
+    "deploy:test:apigw": "bash deploy/test/deploy-apigw.sh",
+    "deploy:test:pack": "bash deploy/test/pack-webapp-fn.sh",
+    "deploy:test:bootstrap": "bash deploy/test/bootstrap-ydb-schema.sh"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
