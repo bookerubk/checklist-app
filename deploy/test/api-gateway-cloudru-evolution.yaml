@@ -1,0 +1,161 @@
+# cloud.ru Evolution API Gateway — TEST
+# Backend: Yandex Cloud Function (HTTP public invoke)
+#   https://functions.yandexcloud.net/${WEBAPP_FN_ID}/...
+#
+# Подстановка: deploy-apigw-cloudru.sh или вручную
+#   ${WEBAPP_FN_ID}  — id webapp Cloud Function (Yandex)
+#
+# Создание в консоли cloud.ru:
+#   Разработка → API Gateway → Создать API-шлюз → загрузить этот YAML
+#
+# Важно: у Yandex CF должен быть allow-unauthenticated-invoke (test).
+openapi: 3.0.0
+info:
+  title: checklist-webapp-test
+  version: 0.1.0
+  description: >
+    Proxy SPA + /api/query на Yandex Cloud Function.
+    Functions и YDB остаются в Yandex Cloud; публичная точка входа — cloud.ru Evolution API Gateway.
+
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /health
+            forwarded_to: /${WEBAPP_FN_ID}/health
+      responses:
+        "200":
+          description: OK
+
+  /api/health:
+    get:
+      operationId: apiHealth
+      summary: API health
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /api/health
+            forwarded_to: /${WEBAPP_FN_ID}/api/health
+      responses:
+        "200":
+          description: OK
+
+  /api/query:
+    post:
+      operationId: apiQuery
+      summary: YDB query proxy
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /api/query
+            forwarded_to: /${WEBAPP_FN_ID}/api/query
+      responses:
+        "200":
+          description: YDB query result
+
+  /:
+    get:
+      operationId: spaRoot
+      summary: SPA index
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /
+            forwarded_to: /${WEBAPP_FN_ID}/
+      responses:
+        "200":
+          description: SPA index
+    head:
+      operationId: spaRootHead
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /
+            forwarded_to: /${WEBAPP_FN_ID}/
+      responses:
+        "200":
+          description: SPA
+
+  # Catch-all для SPA assets и client-side routes.
+  # Evolution: wildcard в URI proxy — см. docs ( /path* ).
+  # Если импорт OpenAPI не создаст wildcard-правило, добавьте вручную
+  # правило «Маршрутизация» с URI proxy /* → backend /${WEBAPP_FN_ID}/*
+  /{path}:
+    get:
+      operationId: spaPath
+      summary: SPA asset or client route
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /{path}
+            forwarded_to: /${WEBAPP_FN_ID}/{path}
+      responses:
+        "200":
+          description: SPA asset or index
+    head:
+      operationId: spaPathHead
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /{path}
+            forwarded_to: /${WEBAPP_FN_ID}/{path}
+      responses:
+        "200":
+          description: SPA
+    options:
+      operationId: spaPathOptions
+      summary: CORS preflight
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-cloud-upstream:
+        $ref: "#/components/x-cloud-upstreams/WebappYcFn"
+      x-cloud-proxy-rewrite:
+        uris:
+          - forwarded_from: /{path}
+            forwarded_to: /${WEBAPP_FN_ID}/{path}
+      responses:
+        "204":
+          description: CORS
+
+components:
+  x-cloud-upstreams:
+    WebappYcFn:
+      name: WebappYcFn
+      description: Yandex Cloud Function webapp (public HTTP invoke)
+      type: url
+      scheme: https
+      nodes:
+        - host: functions.yandexcloud.net
+          weight: 1
+      # CF timeout до 30s — запас на cold start + YDB proxy
+      timeout:
+        connect: 5
+        send: 10
+        read: 35

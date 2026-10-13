@@ -8,6 +8,13 @@ coverage/
 .env.*
 !.env.example
 deploy/test/.env.test
+deploy/test/generated/
+deploy/test/.last-webapp-url
+deploy/test/.last-webapp-id
+deploy/test/.last-gateway-url
+deploy/test/.last-ydb-url
+deploy/test/.last-ydb-id
+deploy/test/.backup-*/
 *.tar
 horeca-registry.tar
 .idea/

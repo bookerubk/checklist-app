@@ -24,8 +24,9 @@ set +a
 : "${ALLOW_UNAUTH_API:=true}"
 : "${YDB_PROXY_TIMEOUT_MS:=25000}"
 : "${DEPLOY_APIGW:=1}"
+: "${APIGW_PROVIDER:=cloudru}"
 
 export PATH="${HOME}/yandex-cloud/bin:${PATH}"
 
 echo "✅ Loaded env from $ENV_FILE"
-echo "   folder=$YC_FOLDER_ID  webapp_fn=$WEBAPP_FN_NAME  app_env=$APP_ENV"
+echo "   folder=$YC_FOLDER_ID  webapp_fn=$WEBAPP_FN_NAME  app_env=$APP_ENV  apigw=$APIGW_PROVIDER"
